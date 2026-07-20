@@ -1,0 +1,51 @@
+name: Controller integrity
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify controller boundary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out controller
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Reject source, build output, and credential-shaped files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          forbidden_paths='^(src|public|dist|node_modules)/|(^|/)(\.env($|\.)|[^/]*\.(pem|key|token|log)$)'
+          tracked_files="$(git ls-files)"
+
+          if grep -E "$forbidden_paths" <<<"$tracked_files"; then
+            echo 'Application source, build output, or credential-shaped files are forbidden.' >&2
+            exit 1
+          fi
+
+          test -f README.md
+          test -f SECURITY.md
+          test -f .github/CODEOWNERS
+          test -f .github/workflows/controller-integrity.yml
+
+      - name: Reject committed GitHub and Cloudflare token prefixes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if git grep -nE 'gh[pousr]_[A-Za-z0-9_]{20,}|[A-Za-z0-9_-]{40,}' -- \
+            ':!README.md' ':!SECURITY.md' ':!.github/workflows/controller-integrity.yml'; then
+            echo 'Possible credential material detected.' >&2
+            exit 1
+          fi
