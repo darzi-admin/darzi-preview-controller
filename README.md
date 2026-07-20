@@ -16,9 +16,10 @@ Phase 0 preview. The application source remains private in
   it, deploys only to `darzi-v1-preview`, and rejects any production deployment.
 - Cloudflare Access must require MFA for the exact approved identities.
 
-The initial commit is the one-time empty-repository bootstrap. No deployment
-secrets are configured and no preview can be deployed until the reviewed
-deployment workflow is merged.
+The initial commit is the recorded one-time empty-repository bootstrap. The
+reviewed deployment workflow remains fail-closed until an independent reviewer,
+all least-privilege environment secrets, and the exact Cloudflare Access policy
+are configured.
 
 ## Required environment secrets
 

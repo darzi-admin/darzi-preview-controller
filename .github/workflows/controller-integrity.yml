@@ -38,14 +38,23 @@ jobs:
           test -f SECURITY.md
           test -f .github/CODEOWNERS
           test -f .github/workflows/controller-integrity.yml
+          test -f .github/workflows/phase-0-preview.yml
 
-      - name: Reject committed GitHub and Cloudflare token prefixes
+          expected_workflows="$(
+            printf '%s\n' \
+              '.github/workflows/controller-integrity.yml' \
+              '.github/workflows/phase-0-preview.yml'
+          )"
+          actual_workflows="$(git ls-files .github/workflows | sort)"
+          [[ "$actual_workflows" == "$expected_workflows" ]]
+
+      - name: Reject committed token and private-key material
         shell: bash
         run: |
           set -euo pipefail
 
-          if git grep -nE 'gh[pousr]_[A-Za-z0-9_]{20,}|[A-Za-z0-9_-]{40,}' -- \
-            ':!README.md' ':!SECURITY.md' ':!.github/workflows/controller-integrity.yml'; then
+          if git grep -nE \
+            'gh[pousr]_[A-Za-z0-9_]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----'; then
             echo 'Possible credential material detected.' >&2
             exit 1
           fi

@@ -1,0 +1,629 @@
+name: Phase 0 protected preview
+
+on:
+  workflow_dispatch:
+    inputs:
+      tested_sha:
+        description: Full 40-character SHA that passed canonical verification
+        required: true
+        type: string
+      confirmation:
+        description: Type DEPLOY PHASE 0 PREVIEW
+        required: true
+        type: string
+      access_confirmed:
+        description: Confirm the exact protected allow-list and MFA policy were reviewed
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudflare-pages-phase-0-preview
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy protected synthetic preview
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment:
+      name: preview
+      url: ${{ steps.deployment.outputs.preview_url }}
+    env:
+      CI: "1"
+      TZ: UTC
+      SOURCE_REPOSITORY: darzi-admin/darzi-v1
+      PREVIEW_PROJECT: darzi-v1-preview
+      PREVIEW_BRANCH: phase-0
+      PREVIEW_ACCESS_DOMAIN: "*.darzi-v1-preview.pages.dev"
+
+    steps:
+      - name: Validate trusted dispatch and remote integration head
+        id: gate
+        shell: bash
+        env:
+          CONTROLLER_TOKEN: ${{ github.token }}
+          SOURCE_REPO_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+          TESTED_SHA: ${{ inputs.tested_sha }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+          ACCESS_CONFIRMED: ${{ inputs.access_confirmed }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$CONFIRMATION" == "DEPLOY PHASE 0 PREVIEW" ]]
+          [[ "$ACCESS_CONFIRMED" == "true" ]]
+          [[ "$TESTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ -n "$SOURCE_REPO_TOKEN" ]]
+
+          controller_headers=(
+            --header "Accept: application/vnd.github+json"
+            --header "Authorization: Bearer $CONTROLLER_TOKEN"
+            --header "X-GitHub-Api-Version: 2022-11-28"
+          )
+          source_headers=(
+            --header "Accept: application/vnd.github+json"
+            --header "Authorization: Bearer $SOURCE_REPO_TOKEN"
+            --header "X-GitHub-Api-Version: 2022-11-28"
+          )
+          repository_json="$RUNNER_TEMP/github-controller-repository.json"
+          main_ref_json="$RUNNER_TEMP/github-main-ref.json"
+          main_branch_json="$RUNNER_TEMP/github-main-branch.json"
+          source_repository_json="$RUNNER_TEMP/github-source-repository.json"
+          integration_ref_json="$RUNNER_TEMP/github-integration-ref.json"
+          ci_runs_json="$RUNNER_TEMP/github-source-ci-runs.json"
+
+          curl --fail --silent --show-error --retry 3 --retry-all-errors \
+            "${controller_headers[@]}" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY" \
+            --output "$repository_json"
+
+          default_branch="$(jq -er '.default_branch' "$repository_json")"
+          jq --arg repository "$GITHUB_REPOSITORY" -e '
+            .full_name == $repository and
+            .visibility == "public" and
+            .private == false
+          ' "$repository_json" >/dev/null
+          [[ "$default_branch" == "main" ]]
+          [[ "$GITHUB_REF" == "refs/heads/$default_branch" ]]
+
+          curl --fail --silent --show-error --retry 3 --retry-all-errors \
+            "${controller_headers[@]}" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/git/ref/heads/$default_branch" \
+            --output "$main_ref_json"
+
+          main_sha="$(jq -er '.object.sha' "$main_ref_json")"
+          [[ "$main_sha" == "$GITHUB_SHA" ]]
+
+          curl --fail --silent --show-error --retry 3 --retry-all-errors \
+            "${controller_headers[@]}" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/branches/$default_branch" \
+            --output "$main_branch_json"
+          jq -e '.name == "main" and .protected == true' "$main_branch_json" >/dev/null
+
+          curl --fail --silent --show-error --retry 3 --retry-all-errors \
+            "${source_headers[@]}" \
+            "https://api.github.com/repos/$SOURCE_REPOSITORY" \
+            --output "$source_repository_json"
+          jq --arg repository "$SOURCE_REPOSITORY" -e '
+            .full_name == $repository and .private == true
+          ' "$source_repository_json" >/dev/null
+
+          curl --fail --silent --show-error --retry 3 --retry-all-errors \
+            "${source_headers[@]}" \
+            "https://api.github.com/repos/$SOURCE_REPOSITORY/git/ref/heads/phase/0/integration" \
+            --output "$integration_ref_json"
+
+          integration_sha="$(jq -er '.object.sha' "$integration_ref_json")"
+          [[ "$integration_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$TESTED_SHA" == "$integration_sha" ]]
+
+          curl --fail --silent --show-error --retry 3 --retry-all-errors \
+            "${source_headers[@]}" \
+            "https://api.github.com/repos/$SOURCE_REPOSITORY/actions/workflows/phase-0-verify.yml/runs?branch=phase%2F0%2Fintegration&event=push&status=completed&per_page=100" \
+            --output "$ci_runs_json"
+          jq --arg sha "$TESTED_SHA" -e '
+            any(.workflow_runs[]?;
+              .head_sha == $sha and
+              .head_branch == "phase/0/integration" and
+              .event == "push" and
+              .status == "completed" and
+              .conclusion == "success"
+            )
+          ' "$ci_runs_json" >/dev/null
+
+          printf 'tested_sha=%s\n' "$TESTED_SHA" >>"$GITHUB_OUTPUT"
+      - name: Check out immutable tested commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ steps.gate.outputs.tested_sha }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Confirm immutable checkout
+        shell: bash
+        env:
+          TESTED_SHA: ${{ steps.gate.outputs.tested_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$TESTED_SHA" ]]
+          git diff --quiet
+          git diff --cached --quiet
+
+      - name: Use repository Node version
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+
+      - name: Pin repository npm version
+        run: |
+          npm install --global npm@11.16.0
+          test "$(node --version)" = "v24.18.0"
+          test "$(npm --version)" = "11.16.0"
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium webkit
+
+      - name: Reverify exact deployment SHA
+        run: npm run verify
+
+      - name: Enforce preview-only project and Access policies
+        id: preflight
+        shell: bash
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_PAGES_API_TOKEN: ${{ secrets.CLOUDFLARE_PAGES_API_TOKEN }}
+          CLOUDFLARE_ACCESS_API_TOKEN: ${{ secrets.CLOUDFLARE_ACCESS_API_TOKEN }}
+          ACCESS_ALLOWED_EMAILS_JSON: ${{ secrets.CLOUDFLARE_ACCESS_ALLOWED_EMAILS_JSON }}
+          ACCESS_ALLOWED_GROUP_IDS_JSON: ${{ secrets.CLOUDFLARE_ACCESS_ALLOWED_GROUP_IDS_JSON }}
+        run: |
+          set -euo pipefail
+          [[ "$CLOUDFLARE_ACCOUNT_ID" =~ ^[0-9a-f]{32}$ ]]
+          [[ -n "$CLOUDFLARE_PAGES_API_TOKEN" ]]
+          [[ -n "$CLOUDFLARE_ACCESS_API_TOKEN" ]]
+
+          jq -e '
+            type == "array" and
+            all(.[];
+              type == "string" and
+              . == ascii_downcase and
+              test("^[a-z0-9.!#$%&\u0027*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$")
+            ) and
+            length == (unique | length)
+          ' <<<"$ACCESS_ALLOWED_EMAILS_JSON" >/dev/null
+          jq -e '
+            type == "array" and
+            all(.[];
+              type == "string" and
+              test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+            ) and
+            length == (unique | length)
+          ' <<<"$ACCESS_ALLOWED_GROUP_IDS_JSON" >/dev/null
+
+          allowed_email_count="$(jq -er 'length' <<<"$ACCESS_ALLOWED_EMAILS_JSON")"
+          allowed_group_count="$(jq -er 'length' <<<"$ACCESS_ALLOWED_GROUP_IDS_JSON")"
+          ((allowed_email_count + allowed_group_count > 0))
+
+          cloudflare_list() {
+            local token="$1"
+            local endpoint="$2"
+            local output="$3"
+            local page=1
+            local separator='?'
+            local response
+            local total_pages
+
+            [[ "$endpoint" == *'?'* ]] && separator='&'
+            : >"$output"
+
+            while :; do
+              response="${output}.page-${page}.json"
+              curl --fail --silent --show-error --retry 3 --retry-all-errors \
+                --header "Authorization: Bearer $token" \
+                "${endpoint}${separator}page=${page}&per_page=100" \
+                --output "$response"
+              jq -e '.success == true and (.result | type == "array")' \
+                "$response" >/dev/null
+              jq -c '.result[]' "$response" >>"$output"
+
+              total_pages="$(jq -er '.result_info.total_pages // 1' "$response")"
+              [[ "$total_pages" =~ ^[0-9]+$ ]]
+              ((total_pages <= 100))
+              if ((page >= total_pages)); then
+                break
+              fi
+              ((page += 1))
+            done
+          }
+
+          api_base="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID"
+          project_json="$RUNNER_TEMP/cloudflare-pages-project.json"
+          production_jsonl="$RUNNER_TEMP/cloudflare-production-deployments.jsonl"
+          preview_jsonl="$RUNNER_TEMP/cloudflare-preview-deployments-before.jsonl"
+          access_jsonl="$RUNNER_TEMP/cloudflare-access-apps.jsonl"
+          policies_jsonl="$RUNNER_TEMP/cloudflare-access-policies.jsonl"
+
+          curl --fail --silent --show-error --retry 3 --retry-all-errors \
+            --header "Authorization: Bearer $CLOUDFLARE_PAGES_API_TOKEN" \
+            "$api_base/pages/projects/$PREVIEW_PROJECT" \
+            --output "$project_json"
+
+          jq --arg project "$PREVIEW_PROJECT" -e '
+            .success == true and
+            .result.name == $project and
+            .result.production_branch == "production-disabled"
+          ' "$project_json" >/dev/null
+
+          cloudflare_list \
+            "$CLOUDFLARE_PAGES_API_TOKEN" \
+            "$api_base/pages/projects/$PREVIEW_PROJECT/deployments?env=production" \
+            "$production_jsonl"
+          [[ ! -s "$production_jsonl" ]]
+
+          cloudflare_list \
+            "$CLOUDFLARE_PAGES_API_TOKEN" \
+            "$api_base/pages/projects/$PREVIEW_PROJECT/deployments?env=preview" \
+            "$preview_jsonl"
+          jq -s 'map(.id)' "$preview_jsonl" \
+            >"$RUNNER_TEMP/cloudflare-preview-deployment-ids-before.json"
+
+          cloudflare_list \
+            "$CLOUDFLARE_ACCESS_API_TOKEN" \
+            "$api_base/access/apps" \
+            "$access_jsonl"
+
+          jq -s --arg domain "$PREVIEW_ACCESS_DOMAIN" -e '
+            [.[] | select(.type == "self_hosted" and .domain == $domain)] |
+            length == 1
+          ' "$access_jsonl" >/dev/null
+
+          access_app_id="$(
+            jq -rs --arg domain "$PREVIEW_ACCESS_DOMAIN" '
+              [.[] | select(.type == "self_hosted" and .domain == $domain)] |
+              .[0].id
+            ' "$access_jsonl"
+          )"
+          [[ "$access_app_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
+
+          cloudflare_list \
+            "$CLOUDFLARE_ACCESS_API_TOKEN" \
+            "$api_base/access/apps/$access_app_id/policies" \
+            "$policies_jsonl"
+
+          jq -s \
+            --argjson allowed_emails "$ACCESS_ALLOWED_EMAILS_JSON" \
+            --argjson allowed_groups "$ACCESS_ALLOWED_GROUP_IDS_JSON" \
+            -e '
+              def exact_email_selector:
+                (keys == ["email"]) and
+                (.email | type == "object") and
+                (.email | keys == ["email"]) and
+                (.email.email | type == "string");
+              def exact_group_selector:
+                (keys == ["group"]) and
+                (.group | type == "object") and
+                (.group | keys == ["id"]) and
+                (.group.id | type == "string");
+              def canonical_selector:
+                if exact_email_selector then
+                  {email: {email: (.email.email | ascii_downcase)}}
+                elif exact_group_selector then
+                  {group: {id: .group.id}}
+                else
+                  error("unsupported Access selector")
+                end;
+              def expected_selectors:
+                (
+                  [$allowed_emails[] | {email: {email: .}}] +
+                  [$allowed_groups[] | {group: {id: .}}]
+                ) | sort_by(tojson);
+              def observed_selectors:
+                [.[] | .include[] | canonical_selector] | sort_by(tojson);
+
+              length > 0 and
+              all(.[];
+                .decision == "allow" and
+                (.include | type == "array") and
+                (.include | length > 0) and
+                all(.include[]; exact_email_selector or exact_group_selector) and
+                ((has("exclude") | not) or .exclude == []) and
+                (.require | type == "array") and
+                (.require == [{"auth_method": {"auth_method": "mfa"}}]) and
+                (.mfa_config.mfa_disabled? != true)
+              ) and
+              (observed_selectors == expected_selectors) and
+              ((observed_selectors | unique_by(tojson) | length) ==
+                (observed_selectors | length))
+            ' "$policies_jsonl" >/dev/null
+
+          printf 'access_app_id=%s\n' "$access_app_id" >>"$GITHUB_OUTPUT"
+          printf 'allow_policy_count=%s\n' \
+            "$(jq -sr 'length' "$policies_jsonl")" >>"$GITHUB_OUTPUT"
+          printf 'allowed_email_count=%s\n' "$allowed_email_count" >>"$GITHUB_OUTPUT"
+          printf 'allowed_group_count=%s\n' "$allowed_group_count" >>"$GITHUB_OUTPUT"
+
+      - name: Deploy preview branch only
+        shell: bash
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_PAGES_API_TOKEN }}
+          TESTED_SHA: ${{ steps.gate.outputs.tested_sha }}
+        run: |
+          set -euo pipefail
+          ./node_modules/.bin/wrangler pages deploy dist \
+            --project-name "$PREVIEW_PROJECT" \
+            --branch "$PREVIEW_BRANCH" \
+            --commit-hash "$TESTED_SHA" \
+            --commit-dirty=false
+
+      - name: Validate exact Cloudflare deployment
+        id: deployment
+        shell: bash
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_PAGES_API_TOKEN: ${{ secrets.CLOUDFLARE_PAGES_API_TOKEN }}
+          TESTED_SHA: ${{ steps.gate.outputs.tested_sha }}
+          ALLOW_POLICY_COUNT: ${{ steps.preflight.outputs.allow_policy_count }}
+          ALLOWED_EMAIL_COUNT: ${{ steps.preflight.outputs.allowed_email_count }}
+          ALLOWED_GROUP_COUNT: ${{ steps.preflight.outputs.allowed_group_count }}
+        run: |
+          set -euo pipefail
+
+          cloudflare_list() {
+            local token="$1"
+            local endpoint="$2"
+            local output="$3"
+            local page=1
+            local separator='?'
+            local response
+            local total_pages
+
+            [[ "$endpoint" == *'?'* ]] && separator='&'
+            : >"$output"
+
+            while :; do
+              response="${output}.page-${page}.json"
+              curl --fail --silent --show-error --retry 3 --retry-all-errors \
+                --header "Authorization: Bearer $token" \
+                "${endpoint}${separator}page=${page}&per_page=100" \
+                --output "$response"
+              jq -e '.success == true and (.result | type == "array")' \
+                "$response" >/dev/null
+              jq -c '.result[]' "$response" >>"$output"
+
+              total_pages="$(jq -er '.result_info.total_pages // 1' "$response")"
+              [[ "$total_pages" =~ ^[0-9]+$ ]]
+              ((total_pages <= 100))
+              if ((page >= total_pages)); then
+                break
+              fi
+              ((page += 1))
+            done
+          }
+
+          api_base="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID"
+          preview_jsonl="$RUNNER_TEMP/cloudflare-preview-deployments-after.jsonl"
+          production_jsonl="$RUNNER_TEMP/cloudflare-production-deployments-after.jsonl"
+          before_ids="$RUNNER_TEMP/cloudflare-preview-deployment-ids-before.json"
+          deployment_json="$RUNNER_TEMP/cloudflare-exact-deployment.json"
+          attestation_json="$RUNNER_TEMP/phase-0-preview-attestation.json"
+          candidate=''
+
+          for attempt in {1..12}; do
+            cloudflare_list \
+              "$CLOUDFLARE_PAGES_API_TOKEN" \
+              "$api_base/pages/projects/$PREVIEW_PROJECT/deployments?env=preview" \
+              "$preview_jsonl"
+
+            candidate="$(
+              jq -cs \
+                --arg sha "$TESTED_SHA" \
+                --arg branch "$PREVIEW_BRANCH" \
+                --slurpfile before "$before_ids" '
+                  ($before[0] // []) as $seen |
+                  map(select(
+                    (.id as $id | ($seen | index($id) | not)) and
+                    .environment == "preview" and
+                    .is_skipped == false and
+                    .latest_stage.name == "deploy" and
+                    .latest_stage.status == "success" and
+                    .deployment_trigger.type == "ad_hoc" and
+                    .deployment_trigger.metadata.branch == $branch and
+                    .deployment_trigger.metadata.commit_hash == $sha and
+                    .deployment_trigger.metadata.commit_dirty == false
+                  )) |
+                  sort_by(.created_on) |
+                  last // empty
+                ' "$preview_jsonl"
+            )"
+
+            if [[ -n "$candidate" ]]; then
+              break
+            fi
+            sleep 5
+          done
+
+          [[ -n "$candidate" ]]
+          printf '%s\n' "$candidate" >"$deployment_json"
+
+          deployment_id="$(jq -er '.id' "$deployment_json")"
+          short_id="$(jq -er '.short_id' "$deployment_json")"
+          preview_url="$(jq -er '.url' "$deployment_json")"
+          deployment_created_at="$(jq -er '.created_on' "$deployment_json")"
+          branch_host="${PREVIEW_BRANCH}.${PREVIEW_PROJECT}.pages.dev"
+          immutable_host="${short_id}.${PREVIEW_PROJECT}.pages.dev"
+
+          [[ "$deployment_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
+          [[ "$short_id" =~ ^[0-9a-f]{8}$ ]]
+          [[ "$preview_url" == "https://$immutable_host" ]]
+          [[ "$deployment_created_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?Z$ ]]
+          date --date="$deployment_created_at" --utc +'%Y-%m-%dT%H:%M:%SZ' >/dev/null
+          jq --arg alias "https://$branch_host" -e '
+            any(.aliases[]?; . == $alias)
+          ' "$deployment_json" >/dev/null
+
+          cloudflare_list \
+            "$CLOUDFLARE_PAGES_API_TOKEN" \
+            "$api_base/pages/projects/$PREVIEW_PROJECT/deployments?env=production" \
+            "$production_jsonl"
+          [[ ! -s "$production_jsonl" ]]
+
+          jq -n \
+            --arg sha "$TESTED_SHA" \
+            --arg url "$preview_url" \
+            --arg deployment_id "$deployment_id" \
+            --arg deployment_created_at "$deployment_created_at" \
+            --arg branch "$PREVIEW_BRANCH" \
+            --arg access_domain "$PREVIEW_ACCESS_DOMAIN" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg source_repository "$SOURCE_REPOSITORY" \
+            --arg workflow_path ".github/workflows/phase-0-preview.yml" \
+            --arg workflow_name "$GITHUB_WORKFLOW" \
+            --arg head_sha "$GITHUB_SHA" \
+            --arg ref "$GITHUB_REF" \
+            --arg event "$GITHUB_EVENT_NAME" \
+            --argjson run_id "$GITHUB_RUN_ID" \
+            --argjson run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg artifact_name "phase-0-preview-attestation-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --argjson allow_policy_count "$ALLOW_POLICY_COUNT" \
+            --argjson allowed_email_count "$ALLOWED_EMAIL_COUNT" \
+            --argjson allowed_group_count "$ALLOWED_GROUP_COUNT" \
+            --arg run_url "https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{
+              schemaVersion: 2,
+              sha: $sha,
+              sourceRepository: $source_repository,
+              status: "pending_authenticated_access_confirmation",
+              url: $url,
+              deploymentId: $deployment_id,
+              cloudflareDeploymentCreatedAt: $deployment_created_at,
+              branch: $branch,
+              cloudflareDeploymentStatus: "success",
+              productionDeploymentsFound: 0,
+              accessAppDomain: $access_domain,
+              accessApprovedSelectorsOnly: true,
+              accessMfaPolicyExpressionRequired: true,
+              approvedNamedEmailCount: $allowed_email_count,
+              approvedAccessGroupCount: $allowed_group_count,
+              allowPolicyCount: $allow_policy_count,
+              broadSelectorCount: 0,
+              bypassPolicyCount: 0,
+              accessSignedOutDenied: false,
+              accessSignedOutCheckedAt: null,
+              accessDisallowedAuthenticatedAccountDenied: false,
+              accessDisallowedAuthenticatedAccountConfirmedBy: null,
+              accessDisallowedAuthenticatedAccountConfirmedAt: null,
+              accessAllowedAccountConfirmed: false,
+              accessAllowedAccountConfirmedBy: null,
+              accessAllowedAccountConfirmedAt: null,
+              mfaConfirmed: false,
+              repository: $repository,
+              workflowPath: $workflow_path,
+              workflowName: $workflow_name,
+              headSha: $head_sha,
+              ref: $ref,
+              event: $event,
+              runId: $run_id,
+              runAttempt: $run_attempt,
+              conclusion: "success",
+              artifactName: $artifact_name,
+              artifactDigest: null,
+              recordedAt: null,
+              finalizedAt: null,
+              githubRunUrl: $run_url
+            }' >"$attestation_json"
+
+          printf 'deployment_id=%s\n' "$deployment_id" >>"$GITHUB_OUTPUT"
+          printf 'preview_url=%s\n' "$preview_url" >>"$GITHUB_OUTPUT"
+
+      - name: Verify signed-out Cloudflare Access redirect on immutable URL
+        shell: bash
+        env:
+          PREVIEW_URL: ${{ steps.deployment.outputs.preview_url }}
+        run: |
+          set -euo pipefail
+          [[ "$PREVIEW_URL" =~ ^https://[0-9a-f]{8}\.darzi-v1-preview\.pages\.dev$ ]]
+          headers="$RUNNER_TEMP/preview-headers.txt"
+          redirected=false
+
+          for attempt in {1..12}; do
+            : >"$headers"
+            status="$(
+              curl --silent --show-error \
+                --output /dev/null \
+                --dump-header "$headers" \
+                --write-out '%{http_code}' \
+                --max-time 20 \
+                "$PREVIEW_URL" || true
+            )"
+
+            if [[ "$status" =~ ^30[1278]$ ]] &&
+              grep -Eiq '^location: https://[^/]*\.cloudflareaccess\.com/' "$headers"; then
+              redirected=true
+              break
+            fi
+
+            sleep 5
+          done
+
+          [[ "$redirected" == "true" ]]
+          attestation="$RUNNER_TEMP/phase-0-preview-attestation.json"
+          updated="$RUNNER_TEMP/phase-0-preview-attestation.updated.json"
+          checked_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          jq --arg checked_at "$checked_at" '
+            .accessSignedOutDenied = true |
+            .accessSignedOutCheckedAt = $checked_at |
+            .recordedAt = $checked_at |
+            .status = "pending_authenticated_access_confirmation"
+          ' "$attestation" >"$updated"
+          mv "$updated" "$attestation"
+
+      - name: Record preview evidence summary
+        shell: bash
+        env:
+          DEPLOYMENT_ID: ${{ steps.deployment.outputs.deployment_id }}
+          PREVIEW_URL: ${{ steps.deployment.outputs.preview_url }}
+          TESTED_SHA: ${{ steps.gate.outputs.tested_sha }}
+        run: |
+          {
+            echo '## Phase 0 protected preview'
+            echo
+            echo "- Private source: $SOURCE_REPOSITORY@$TESTED_SHA"
+            echo "- Controller SHA: $GITHUB_SHA"
+            echo "- Cloudflare deployment ID: $DEPLOYMENT_ID"
+            echo "- Immutable preview URL: $PREVIEW_URL"
+            echo '- Signed-out Cloudflare Access redirect: passed'
+            echo '- Disallowed authenticated-account denial: still required externally'
+            echo '- Named allowed-account and MFA proof: still required externally'
+            echo '- Production deployments observed: zero'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload preview attestation candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: phase-0-preview-attestation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/phase-0-preview-attestation.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload failure evidence
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: phase-0-preview-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .darzi/verification/latest.json
+            coverage/
+            playwright-report/
+            test-results/
+            ${{ runner.temp }}/phase-0-preview-attestation.json
+          if-no-files-found: warn
+          retention-days: 14
