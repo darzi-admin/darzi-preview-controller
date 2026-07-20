@@ -25,20 +25,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  deploy:
-    name: Deploy protected synthetic preview
+  build:
+    name: Build and verify immutable static bundle
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    environment:
-      name: preview
-      url: ${{ steps.deployment.outputs.preview_url }}
+    outputs:
+      tested_sha: ${{ steps.gate.outputs.tested_sha }}
+      bundle_artifact_id: ${{ steps.bundle.outputs.artifact-id }}
+      bundle_digest: ${{ steps.bundle.outputs.artifact-digest }}
     env:
       CI: "1"
       TZ: UTC
       SOURCE_REPOSITORY: darzi-admin/darzi-v1
-      PREVIEW_PROJECT: darzi-v1-preview
-      PREVIEW_BRANCH: phase-0
-      PREVIEW_ACCESS_DOMAIN: "*.darzi-v1-preview.pages.dev"
 
     steps:
       - name: Validate trusted dispatch and remote integration head
@@ -174,6 +172,95 @@ jobs:
 
       - name: Reverify exact deployment SHA
         run: npm run verify
+      - name: Build static deployment bundle
+        run: npm run build
+
+      - name: Assemble digest-bound static artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d dist
+          if find dist -type l -print -quit | grep -q .; then
+            echo 'Symbolic links are forbidden in the static deployment bundle.' >&2
+            exit 1
+          fi
+          find dist -type f -print -quit | grep -q .
+
+          bundle_root="$RUNNER_TEMP/phase-0-bundle"
+          mkdir -p "$bundle_root"
+          cp -a dist "$bundle_root/dist"
+          (
+            cd "$bundle_root"
+            find dist -type f -print0 |
+              LC_ALL=C sort -z |
+              xargs -0 sha256sum >SHA256SUMS
+            sha256sum --check --strict SHA256SUMS
+          )
+
+      - name: Upload verified static artifact
+        id: bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: phase-0-site-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/phase-0-bundle/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload verification failure evidence
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: phase-0-build-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .darzi/verification/latest.json
+            coverage/
+            playwright-report/
+            test-results/
+          if-no-files-found: warn
+          retention-days: 14
+
+  deploy:
+    name: Deploy protected synthetic preview
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: preview
+      url: ${{ steps.deployment.outputs.preview_url }}
+    env:
+      TZ: UTC
+      SOURCE_REPOSITORY: darzi-admin/darzi-v1
+      PREVIEW_PROJECT: darzi-v1-preview
+      PREVIEW_BRANCH: phase-0
+      PREVIEW_ACCESS_DOMAIN: "*.darzi-v1-preview.pages.dev"
+
+    steps:
+      - name: Download exact verified static artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          artifact-ids: ${{ needs.build.outputs.bundle_artifact_id }}
+          path: ${{ runner.temp }}/phase-0-bundle
+
+      - name: Validate static artifact handoff
+        shell: bash
+        env:
+          EXPECTED_ARTIFACT_ID: ${{ needs.build.outputs.bundle_artifact_id }}
+          EXPECTED_ARTIFACT_DIGEST: ${{ needs.build.outputs.bundle_digest }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$EXPECTED_ARTIFACT_DIGEST" =~ ^(sha256:)?[0-9a-f]{64}$ ]]
+          bundle_root="$RUNNER_TEMP/phase-0-bundle"
+          test -d "$bundle_root/dist"
+          test -f "$bundle_root/SHA256SUMS"
+          if find "$bundle_root" -type l -print -quit | grep -q .; then
+            echo 'Symbolic links are forbidden in the downloaded deployment bundle.' >&2
+            exit 1
+          fi
+          (
+            cd "$bundle_root"
+            sha256sum --check --strict SHA256SUMS
+          )
 
       - name: Enforce preview-only project and Access policies
         id: preflight
@@ -350,18 +437,17 @@ jobs:
           printf 'allowed_email_count=%s\n' "$allowed_email_count" >>"$GITHUB_OUTPUT"
           printf 'allowed_group_count=%s\n' "$allowed_group_count" >>"$GITHUB_OUTPUT"
 
-      - name: Deploy preview branch only
-        shell: bash
-        env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_PAGES_API_TOKEN }}
-          TESTED_SHA: ${{ steps.gate.outputs.tested_sha }}
-        run: |
-          set -euo pipefail
-          ./node_modules/.bin/wrangler pages deploy dist \
-            --project-name "$PREVIEW_PROJECT" \
-            --branch "$PREVIEW_BRANCH" \
-            --commit-hash "$TESTED_SHA" \
+      - name: Deploy preview branch only from the verified static artifact
+        uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_PAGES_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: 4.112.0
+          command: >-
+            pages deploy ${{ runner.temp }}/phase-0-bundle/dist
+            --project-name darzi-v1-preview
+            --branch phase-0
+            --commit-hash ${{ needs.build.outputs.tested_sha }}
             --commit-dirty=false
 
       - name: Validate exact Cloudflare deployment
@@ -370,7 +456,7 @@ jobs:
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_PAGES_API_TOKEN: ${{ secrets.CLOUDFLARE_PAGES_API_TOKEN }}
-          TESTED_SHA: ${{ steps.gate.outputs.tested_sha }}
+          TESTED_SHA: ${{ needs.build.outputs.tested_sha }}
           ALLOW_POLICY_COUNT: ${{ steps.preflight.outputs.allow_policy_count }}
           ALLOWED_EMAIL_COUNT: ${{ steps.preflight.outputs.allowed_email_count }}
           ALLOWED_GROUP_COUNT: ${{ steps.preflight.outputs.allowed_group_count }}
@@ -591,7 +677,7 @@ jobs:
         env:
           DEPLOYMENT_ID: ${{ steps.deployment.outputs.deployment_id }}
           PREVIEW_URL: ${{ steps.deployment.outputs.preview_url }}
-          TESTED_SHA: ${{ steps.gate.outputs.tested_sha }}
+          TESTED_SHA: ${{ needs.build.outputs.tested_sha }}
         run: |
           {
             echo '## Phase 0 protected preview'
@@ -619,11 +705,6 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: phase-0-preview-failure-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            .darzi/verification/latest.json
-            coverage/
-            playwright-report/
-            test-results/
-            ${{ runner.temp }}/phase-0-preview-attestation.json
+          path: ${{ runner.temp }}/phase-0-preview-attestation.json
           if-no-files-found: warn
           retention-days: 14

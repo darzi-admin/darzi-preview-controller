@@ -11,9 +11,14 @@ Phase 0 preview. The application source remains private in
 - `main` is the trusted controller branch and must remain protected.
 - Deployments must use the `preview` environment with an independent required
   reviewer and prevent-self-review enabled.
-- Environment secrets are released only after approval.
+- The source build job receives only a read-only private-source token and never
+  receives Cloudflare credentials.
+- Cloudflare environment secrets are released only after approval to a fresh
+  runner that downloads the exact digest-bound static artifact. It never
+  executes private-source tooling.
 - The controller accepts only the current private integration SHA, reverifies
-  it, deploys only to `darzi-v1-preview`, and rejects any production deployment.
+  and builds it, deploys only to `darzi-v1-preview`, and rejects any production
+  deployment.
 - Cloudflare Access must require MFA for the exact approved identities.
 
 The initial commit is the recorded one-time empty-repository bootstrap. The
@@ -21,10 +26,13 @@ reviewed deployment workflow remains fail-closed until an independent reviewer,
 all least-privilege environment secrets, and the exact Cloudflare Access policy
 are configured.
 
-## Required environment secrets
+## Required repository secret
 
 - `SOURCE_REPO_TOKEN`: fine-grained, read-only access to contents and Actions
   in `darzi-admin/darzi-v1` only.
+
+## Required `preview` environment secrets
+
 - `CLOUDFLARE_ACCOUNT_ID`
 - `CLOUDFLARE_PAGES_API_TOKEN`: Pages Write only.
 - `CLOUDFLARE_ACCESS_API_TOKEN`: Access Apps and Policies Read only.

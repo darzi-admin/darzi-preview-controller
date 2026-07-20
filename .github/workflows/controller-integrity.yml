@@ -58,3 +58,47 @@ jobs:
             echo 'Possible credential material detected.' >&2
             exit 1
           fi
+      - name: Enforce immutable actions and the deployment secret boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          expected_actions="$(
+            printf '%s\n' \
+              'actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10' \
+              'actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c' \
+              'actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38' \
+              'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a' \
+              'cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0' |
+              sort
+          )"
+          actual_actions="$(
+            sed -nE \
+              's/^[[:space:]]*uses:[[:space:]]*([^[:space:]]+).*/\1/p' \
+              .github/workflows/*.yml |
+              sort -u
+          )"
+          [[ "$actual_actions" == "$expected_actions" ]]
+
+          while IFS= read -r action; do
+            [[ "$action" =~ ^[^@]+@[0-9a-f]{40}$ ]]
+          done <<<"$actual_actions"
+
+          workflow='.github/workflows/phase-0-preview.yml'
+          build_section="$(sed -n '/^  build:/,/^  deploy:/p' "$workflow")"
+          deploy_section="$(sed -n '/^  deploy:/,$p' "$workflow")"
+
+          if grep -q 'CLOUDFLARE_' <<<"$build_section"; then
+            echo 'Cloudflare secrets must never enter the source build job.' >&2
+            exit 1
+          fi
+
+          if grep -Eq \
+            'actions/(checkout|setup-node)|node_modules|(^|[[:space:]])(npm|npx)[[:space:]]' \
+            <<<"$deploy_section"; then
+            echo 'The protected deploy job must not execute private-source tooling.' >&2
+            exit 1
+          fi
+
+          grep -q 'actions/download-artifact@' <<<"$deploy_section"
+          grep -q 'cloudflare/wrangler-action@' <<<"$deploy_section"
