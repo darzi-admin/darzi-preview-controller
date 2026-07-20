@@ -26,20 +26,19 @@ concurrency:
 
 jobs:
   build:
-    name: Build and verify immutable static bundle
+    name: Validate and relay encrypted static bundle
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 10
     outputs:
       tested_sha: ${{ steps.gate.outputs.tested_sha }}
       bundle_artifact_id: ${{ steps.bundle.outputs.artifact-id }}
       bundle_digest: ${{ steps.bundle.outputs.artifact-digest }}
     env:
-      CI: "1"
       TZ: UTC
       SOURCE_REPOSITORY: darzi-admin/darzi-v1
 
     steps:
-      - name: Validate trusted dispatch and remote integration head
+      - name: Validate trusted dispatch and download encrypted source bundle
         id: gate
         shell: bash
         env:
@@ -55,6 +54,9 @@ jobs:
           [[ "$ACCESS_CONFIRMED" == "true" ]]
           [[ "$TESTED_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ -n "$SOURCE_REPO_TOKEN" ]]
+          [[ "$SOURCE_REPO_TOKEN" != "$CONTROLLER_TOKEN" ]]
+
+          umask 077
 
           controller_headers=(
             --header "Accept: application/vnd.github+json"
@@ -72,6 +74,9 @@ jobs:
           source_repository_json="$RUNNER_TEMP/github-source-repository.json"
           integration_ref_json="$RUNNER_TEMP/github-integration-ref.json"
           ci_runs_json="$RUNNER_TEMP/github-source-ci-runs.json"
+          selected_ci_run_json="$RUNNER_TEMP/github-selected-source-ci-run.json"
+          source_artifacts_json="$RUNNER_TEMP/github-source-ci-artifacts.json"
+          encrypted_archive="$RUNNER_TEMP/phase-0-source-bundle.zip"
 
           curl --fail --silent --show-error --retry 3 --retry-all-errors \
             "${controller_headers[@]}" \
@@ -123,101 +128,82 @@ jobs:
             "https://api.github.com/repos/$SOURCE_REPOSITORY/actions/workflows/phase-0-verify.yml/runs?branch=phase%2F0%2Fintegration&event=push&status=completed&per_page=100" \
             --output "$ci_runs_json"
           jq --arg sha "$TESTED_SHA" -e '
-            any(.workflow_runs[]?;
+            [
+              .workflow_runs[]? |
+              select(
               .head_sha == $sha and
               .head_branch == "phase/0/integration" and
               .event == "push" and
               .status == "completed" and
               .conclusion == "success"
-            )
-          ' "$ci_runs_json" >/dev/null
+              )
+            ] |
+            sort_by(.run_attempt, .id) |
+            last
+          ' "$ci_runs_json" >"$selected_ci_run_json"
+
+          source_ci_run_id="$(jq -er '.id' "$selected_ci_run_json")"
+          source_ci_run_attempt="$(jq -er '.run_attempt' "$selected_ci_run_json")"
+          [[ "$source_ci_run_id" =~ ^[1-9][0-9]*$ ]]
+          [[ "$source_ci_run_attempt" =~ ^[1-9][0-9]*$ ]]
+
+          curl --fail --silent --show-error --retry 3 --retry-all-errors \
+            "${source_headers[@]}" \
+            "https://api.github.com/repos/$SOURCE_REPOSITORY/actions/runs/$source_ci_run_id/artifacts?per_page=100" \
+            --output "$source_artifacts_json"
+
+          source_bundle_name="phase-0-deploy-bundle-$source_ci_run_id-$source_ci_run_attempt"
+          jq \
+            --arg name "$source_bundle_name" \
+            --arg sha "$TESTED_SHA" \
+            --argjson run_id "$source_ci_run_id" \
+            -e '
+              [
+                .artifacts[]? |
+                select(
+                  .name == $name and
+                  .expired == false and
+                  .size_in_bytes > 0 and
+                  .size_in_bytes <= 104857600 and
+                  .workflow_run.id == $run_id and
+                  .workflow_run.head_sha == $sha
+                )
+              ] |
+              length == 1
+            ' "$source_artifacts_json" >/dev/null
+
+          source_bundle_artifact_id="$(
+            jq \
+              --arg name "$source_bundle_name" \
+              -er '.artifacts[] | select(.name == $name and .expired == false) | .id' \
+              "$source_artifacts_json"
+          )"
+          [[ "$source_bundle_artifact_id" =~ ^[1-9][0-9]*$ ]]
+
+          curl --fail --silent --show-error --retry 3 --retry-all-errors \
+            --location \
+            "${source_headers[@]}" \
+            "https://api.github.com/repos/$SOURCE_REPOSITORY/actions/artifacts/$source_bundle_artifact_id/zip" \
+            --output "$encrypted_archive"
+          test -s "$encrypted_archive"
+
+          archive_entries="$(unzip -Z1 "$encrypted_archive")"
+          [[ "$archive_entries" == "phase-0-deploy-bundle.tar.gpg" ]]
+          encrypted_root="$RUNNER_TEMP/encrypted-source-bundle"
+          mkdir -p "$encrypted_root"
+          unzip -q "$encrypted_archive" -d "$encrypted_root"
+          test -s "$encrypted_root/phase-0-deploy-bundle.tar.gpg"
 
           printf 'tested_sha=%s\n' "$TESTED_SHA" >>"$GITHUB_OUTPUT"
-      - name: Check out immutable tested commit
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          repository: ${{ env.SOURCE_REPOSITORY }}
-          ref: ${{ steps.gate.outputs.tested_sha }}
-          token: ${{ secrets.SOURCE_REPO_TOKEN }}
-          fetch-depth: 0
-          persist-credentials: false
 
-      - name: Confirm immutable checkout
-        shell: bash
-        env:
-          TESTED_SHA: ${{ steps.gate.outputs.tested_sha }}
-        run: |
-          set -euo pipefail
-          [[ "$(git rev-parse HEAD)" == "$TESTED_SHA" ]]
-          git diff --quiet
-          git diff --cached --quiet
-
-      - name: Use repository Node version
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
-        with:
-          node-version-file: .node-version
-          package-manager-cache: false
-
-      - name: Pin repository npm version
-        run: |
-          npm install --global npm@11.16.0
-          test "$(node --version)" = "v24.18.0"
-          test "$(npm --version)" = "11.16.0"
-
-      - name: Install locked dependencies
-        run: npm ci
-
-      - name: Install Playwright browsers
-        run: npx playwright install --with-deps chromium webkit
-
-      - name: Reverify exact deployment SHA
-        run: npm run verify
-      - name: Build static deployment bundle
-        run: npm run build
-
-      - name: Assemble digest-bound static artifact
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -d dist
-          if find dist -type l -print -quit | grep -q .; then
-            echo 'Symbolic links are forbidden in the static deployment bundle.' >&2
-            exit 1
-          fi
-          find dist -type f -print -quit | grep -q .
-
-          bundle_root="$RUNNER_TEMP/phase-0-bundle"
-          mkdir -p "$bundle_root"
-          cp -a dist "$bundle_root/dist"
-          (
-            cd "$bundle_root"
-            find dist -type f -print0 |
-              LC_ALL=C sort -z |
-              xargs -0 sha256sum >SHA256SUMS
-            sha256sum --check --strict SHA256SUMS
-          )
-
-      - name: Upload verified static artifact
+      - name: Upload encrypted relay artifact
         id: bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: phase-0-site-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/phase-0-bundle/
+          name: phase-0-encrypted-site-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/encrypted-source-bundle/phase-0-deploy-bundle.tar.gpg
           if-no-files-found: error
           retention-days: 1
-
-      - name: Upload verification failure evidence
-        if: ${{ failure() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: phase-0-build-failure-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            .darzi/verification/latest.json
-            coverage/
-            playwright-report/
-            test-results/
-          if-no-files-found: warn
-          retention-days: 14
 
   deploy:
     name: Deploy protected synthetic preview
@@ -239,24 +225,65 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           artifact-ids: ${{ needs.build.outputs.bundle_artifact_id }}
-          path: ${{ runner.temp }}/phase-0-bundle
+          path: ${{ runner.temp }}/phase-0-encrypted-bundle
 
-      - name: Validate static artifact handoff
+      - name: Authenticate and validate encrypted artifact handoff
         shell: bash
         env:
           EXPECTED_ARTIFACT_ID: ${{ needs.build.outputs.bundle_artifact_id }}
           EXPECTED_ARTIFACT_DIGEST: ${{ needs.build.outputs.bundle_digest }}
+          BUNDLE_ENCRYPTION_PASSPHRASE: ${{ secrets.BUNDLE_ENCRYPTION_PASSPHRASE }}
         run: |
           set -euo pipefail
           [[ "$EXPECTED_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
           [[ "$EXPECTED_ARTIFACT_DIGEST" =~ ^(sha256:)?[0-9a-f]{64}$ ]]
-          bundle_root="$RUNNER_TEMP/phase-0-bundle"
+          (( ${#BUNDLE_ENCRYPTION_PASSPHRASE} >= 32 ))
+
+          encrypted_root="$RUNNER_TEMP/phase-0-encrypted-bundle"
+          encrypted_bundle="$encrypted_root/phase-0-deploy-bundle.tar.gpg"
+          clear_bundle="$RUNNER_TEMP/phase-0-deploy-bundle.tar"
+          bundle_root="$RUNNER_TEMP/phase-0-decrypted-bundle"
+          test -s "$encrypted_bundle"
+          [[ "$(find "$encrypted_root" -mindepth 1 -maxdepth 1 -printf '%f\n')" == \
+            "phase-0-deploy-bundle.tar.gpg" ]]
+
+          gpg --batch --yes --pinentry-mode loopback \
+            --passphrase "$BUNDLE_ENCRYPTION_PASSPHRASE" \
+            --decrypt --output "$clear_bundle" "$encrypted_bundle"
+          test -s "$clear_bundle"
+
+          mkdir -p "$bundle_root"
+          tar --extract --file "$clear_bundle" --directory "$bundle_root" \
+            --no-same-owner --no-same-permissions
+          rm -- "$clear_bundle"
           test -d "$bundle_root/dist"
           test -f "$bundle_root/SHA256SUMS"
+          find "$bundle_root/dist" -type f -print -quit | grep -q .
+          top_level="$(find "$bundle_root" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)"
+          [[ "$top_level" == $'SHA256SUMS\ndist' ]]
           if find "$bundle_root" -type l -print -quit | grep -q .; then
-            echo 'Symbolic links are forbidden in the downloaded deployment bundle.' >&2
+            echo 'Symbolic links are forbidden in the decrypted deployment bundle.' >&2
             exit 1
           fi
+          if find "$bundle_root" ! -type d ! -type f -print -quit | grep -q .; then
+            echo 'Only regular files and directories are allowed in the decrypted bundle.' >&2
+            exit 1
+          fi
+
+          manifest_entries=0
+          while IFS= read -r manifest_line; do
+            [[ "$manifest_line" =~ ^[0-9a-f]{64}\ \ dist/.+ ]]
+            manifest_path="${manifest_line:66}"
+            [[ "$manifest_path" != /* ]]
+            [[ "$manifest_path" != "../"* ]]
+            [[ "$manifest_path" != *"/../"* ]]
+            test -f "$bundle_root/$manifest_path"
+            ((manifest_entries += 1))
+          done <"$bundle_root/SHA256SUMS"
+          ((manifest_entries > 0))
+          actual_entries="$(find "$bundle_root/dist" -type f -printf '.' | wc -c)"
+          [[ "$actual_entries" == "$manifest_entries" ]]
+
           (
             cd "$bundle_root"
             sha256sum --check --strict SHA256SUMS
@@ -444,7 +471,7 @@ jobs:
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           wranglerVersion: 4.112.0
           command: >-
-            pages deploy ${{ runner.temp }}/phase-0-bundle/dist
+            pages deploy ${{ runner.temp }}/phase-0-decrypted-bundle/dist
             --project-name darzi-v1-preview
             --branch phase-0
             --commit-hash ${{ needs.build.outputs.tested_sha }}

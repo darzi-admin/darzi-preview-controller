@@ -11,14 +11,17 @@ Phase 0 preview. The application source remains private in
 - `main` is the trusted controller branch and must remain protected.
 - Deployments must use the `preview` environment from protected `main` after an
   explicit owner dispatch with the exact tested source SHA and confirmation.
-- The source build job receives only a read-only private-source token and never
-  receives Cloudflare credentials.
+- Private source CI verifies the exact integration SHA, builds the static site,
+  encrypts the digest-bound bundle and keeps test-failure evidence private.
+- The public relay job receives only a read-only private-source token, downloads
+  the exact encrypted CI artifact and never receives Cloudflare credentials or
+  clear application output.
 - Cloudflare environment secrets are available only to a fresh environment
-  runner that downloads the exact digest-bound static artifact. It never
-  executes private-source tooling.
-- The controller accepts only the current private integration SHA, reverifies
-  and builds it, deploys only to `darzi-v1-preview`, and rejects any production
-  deployment.
+  runner that authenticates and decrypts the exact digest-bound static artifact.
+  It never checks out or executes private-source tooling.
+- The controller accepts only the current private integration SHA and its exact
+  successful push-run artifact, deploys only to `darzi-v1-preview`, and rejects
+  any production deployment.
 - Cloudflare Access must require MFA for the exact approved identities.
 
 The initial commit is the recorded one-time empty-repository bootstrap. Because
@@ -36,6 +39,8 @@ Cloudflare Access policy are configured.
 
 ## Required `preview` environment secrets
 
+- `BUNDLE_ENCRYPTION_PASSPHRASE`: the same randomly generated value stored in
+  private source CI; at least 32 characters.
 - `CLOUDFLARE_ACCOUNT_ID`
 - `CLOUDFLARE_PAGES_API_TOKEN`: Pages Write only.
 - `CLOUDFLARE_ACCESS_API_TOKEN`: Access Apps and Policies Read only.

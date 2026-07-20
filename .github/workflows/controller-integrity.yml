@@ -67,7 +67,6 @@ jobs:
             printf '%s\n' \
               'actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10' \
               'actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c' \
-              'actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38' \
               'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a' \
               'cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0' |
               sort
@@ -94,9 +93,26 @@ jobs:
           fi
 
           if grep -Eq \
+            'actions/(checkout|setup-node)|(^|[[:space:]])(npm|npx)[[:space:]]|\.darzi/|coverage/|playwright-report/|test-results/' \
+            <<<"$build_section"; then
+            echo 'The public relay job must not check out, execute, or upload private-source material.' >&2
+            exit 1
+          fi
+
+          grep -q 'phase-0-deploy-bundle.tar.gpg' <<<"$build_section"
+          grep -q '/actions/artifacts/' <<<"$build_section"
+          grep -q 'BUNDLE_ENCRYPTION_PASSPHRASE' <<<"$deploy_section"
+          grep -q -- '--decrypt' <<<"$deploy_section"
+
+          if grep -Eq \
             'actions/(checkout|setup-node)|node_modules|(^|[[:space:]])(npm|npx)[[:space:]]' \
             <<<"$deploy_section"; then
             echo 'The protected deploy job must not execute private-source tooling.' >&2
+            exit 1
+          fi
+
+          if grep -q 'SOURCE_REPO_TOKEN' <<<"$deploy_section"; then
+            echo 'The private-source token must never enter the protected deploy job.' >&2
             exit 1
           fi
 
