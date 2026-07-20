@@ -9,11 +9,11 @@ Phase 0 preview. The application source remains private in
 - No application source, compiled application, client data, credentials, or
   Cloudflare identity lists may be committed here.
 - `main` is the trusted controller branch and must remain protected.
-- Deployments must use the `preview` environment with an independent required
-  reviewer and prevent-self-review enabled.
+- Deployments must use the `preview` environment from protected `main` after an
+  explicit owner dispatch with the exact tested source SHA and confirmation.
 - The source build job receives only a read-only private-source token and never
   receives Cloudflare credentials.
-- Cloudflare environment secrets are released only after approval to a fresh
+- Cloudflare environment secrets are available only to a fresh environment
   runner that downloads the exact digest-bound static artifact. It never
   executes private-source tooling.
 - The controller accepts only the current private integration SHA, reverifies
@@ -21,10 +21,13 @@ Phase 0 preview. The application source remains private in
   deployment.
 - Cloudflare Access must require MFA for the exact approved identities.
 
-The initial commit is the recorded one-time empty-repository bootstrap. The
-reviewed deployment workflow remains fail-closed until an independent reviewer,
-all least-privilege environment secrets, and the exact Cloudflare Access policy
-are configured.
+The initial commit is the recorded one-time empty-repository bootstrap. Because
+Darzi currently has one GitHub operator, Phase 0 uses a recorded owner-only
+approval exception. This reduces protection against compromise of that account;
+the required status check, pull-request history, exact-SHA verification,
+main-only environment policy and no-admin-bypass setting remain mandatory. The
+workflow remains fail-closed until all least-privilege secrets and the exact
+Cloudflare Access policy are configured.
 
 ## Required repository secret
 
