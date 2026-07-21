@@ -9,21 +9,38 @@ Phase 0 preview. The application source remains private in
 - No application source, compiled application, client data, credentials, or
   Cloudflare identity lists may be committed here.
 - `main` is the trusted controller branch and must remain protected.
-- Deployments must use the `preview` environment with an independent required
-  reviewer and prevent-self-review enabled.
-- Environment secrets are released only after approval.
-- The controller accepts only the current private integration SHA, reverifies
-  it, deploys only to `darzi-v1-preview`, and rejects any production deployment.
+- Deployments must use the `preview` environment from protected `main` after an
+  explicit owner dispatch with the exact tested source SHA and confirmation.
+- Private source CI verifies the exact integration SHA, builds the static site,
+  encrypts the digest-bound bundle and keeps test-failure evidence private.
+- The public relay job receives only a read-only private-source token, downloads
+  the exact encrypted CI artifact and never receives Cloudflare credentials or
+  clear application output.
+- Cloudflare environment secrets are available only to a fresh environment
+  runner that authenticates and decrypts the exact digest-bound static artifact.
+  It never checks out or executes private-source tooling.
+- The controller accepts only the current private integration SHA and its exact
+  successful push-run artifact, deploys only to `darzi-v1-preview`, and rejects
+  any production deployment.
 - Cloudflare Access must require MFA for the exact approved identities.
 
-The initial commit is the one-time empty-repository bootstrap. No deployment
-secrets are configured and no preview can be deployed until the reviewed
-deployment workflow is merged.
+The initial commit is the recorded one-time empty-repository bootstrap. Because
+Darzi currently has one GitHub operator, Phase 0 uses a recorded owner-only
+approval exception. This reduces protection against compromise of that account;
+the required status check, pull-request history, exact-SHA verification,
+main-only environment policy and no-admin-bypass setting remain mandatory. The
+workflow remains fail-closed until all least-privilege secrets and the exact
+Cloudflare Access policy are configured.
 
-## Required environment secrets
+## Required repository secret
 
 - `SOURCE_REPO_TOKEN`: fine-grained, read-only access to contents and Actions
   in `darzi-admin/darzi-v1` only.
+
+## Required `preview` environment secrets
+
+- `BUNDLE_ENCRYPTION_PASSPHRASE`: the same randomly generated value stored in
+  private source CI; at least 32 characters.
 - `CLOUDFLARE_ACCOUNT_ID`
 - `CLOUDFLARE_PAGES_API_TOKEN`: Pages Write only.
 - `CLOUDFLARE_ACCESS_API_TOKEN`: Access Apps and Policies Read only.
